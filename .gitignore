@@ -11,7 +11,6 @@ archive/
 archive.zip
 
 # Model & output besar
-models/
 plots_final/
 *.npy
 *.npz
