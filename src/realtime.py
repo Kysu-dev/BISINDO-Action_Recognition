@@ -63,7 +63,7 @@ class BISINDORealtimeRecognition:
         
         self.holistic = self.mp_holistic.Holistic(
             static_image_mode=False,
-            model_complexity=1,
+            model_complexity=0,  # ✅ 1→0 (lebih cepat!)
             smooth_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
@@ -420,9 +420,9 @@ class BISINDORealtimeRecognition:
             print("❌ Cannot open webcam!")
             return
         
-        # Set resolution
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Set resolution (TURUNKAN untuk FPS lebih tinggi)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)   # ✅ 1280→640
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # ✅ 720→480
         
         print("✅ Webcam started")
         print("\n" + "="*70)
@@ -467,9 +467,18 @@ class BISINDORealtimeRecognition:
                             sequence = self.preprocess_sequence(self.landmark_buffer)
                             if sequence is not None:
                                 pred_label, pred_conf = self.predict(sequence)
+                                
+                                # 🔍 DEBUG: Print raw prediction
+                                print(f"🎯 RAW Prediction: {pred_label} | Confidence: {pred_conf:.2%}")
+                                
                                 current_prediction, current_confidence = self.smooth_prediction(
                                     pred_label, pred_conf
                                 )
+                                
+                                # 🔍 DEBUG: Print smoothed prediction
+                                print(f"✨ Smoothed: {current_prediction} | Confidence: {current_confidence:.2%}")
+                                print(f"   Threshold: {self.confidence_threshold} | Will show: {current_confidence >= self.confidence_threshold}")
+                                print("-" * 60)
                             
                             # Keep last 50% of buffer for continuous prediction
                             keep_frames = self.target_frames // 2
@@ -559,8 +568,8 @@ def main():
     recognizer = BISINDORealtimeRecognition(
         model_path=MODEL_PATH,
         label_map_path=LABEL_MAP_PATH,
-        target_frames=30,
-        confidence_threshold=0.5,
+        target_frames=20,  # ✅ 30→20 (lebih cepat penuh!)
+        confidence_threshold=0.3,
         smoothing_window=3
     )
     
