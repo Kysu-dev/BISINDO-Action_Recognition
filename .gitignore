@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+bisindo_env_39/
+
+# Dataset & archive
+data/
+archive/
+archive.zip
+
+# Model & output besar
+models/
+plots_final/
+*.npy
+*.npz
+
+# OS
+.DS_Store
