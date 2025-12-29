@@ -1,596 +1,572 @@
-"""
-realtime_predictor.py - FIXED VERSION with correct dimensions
-"""
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import cv2
 import numpy as np
-import tensorflow as tf
-import pickle
 import mediapipe as mp
-import time
-import warnings
-import os
-import sys
-from collections import deque, Counter
-warnings.filterwarnings('ignore')
+import tensorflow as tf
+from collections import deque
+from pathlib import Path
+import json
+from scipy.ndimage import gaussian_filter1d
 
-print("="*80)
-print("🎯 REAL-TIME BISINDO GESTURE RECOGNITION - FIXED VERSION")
-print("="*80)
 
-# ==================== CONFIGURATION ====================
-BASE_DIR = r"D:\Kuliah\Semester 5\Computer_Vision\BISINDO"
-MODEL_PATH = os.path.join(BASE_DIR, "models", "bisindo_final_model.h5")
-CLASS_NAMES_PATH = os.path.join(BASE_DIR, "models", "class_names.pkl")
-
-# Sesuaikan dengan model training Anda
-SEQ_LENGTH = 30  # Dari training
-FEATURES = 162   # HARUS SAMA dengan training!
-
-# Realtime settings
-MIN_DETECTION_CONFIDENCE = 0.7
-MIN_TRACKING_CONFIDENCE = 0.5
-PREDICTION_THRESHOLD = 0.7  # Diturunkan sedikit
-SMOOTHING_WINDOW = 3  # Diperkecil untuk respons lebih cepat
-
-# ==================== DEBUG: CHECK MODEL INPUT SHAPE ====================
-print("\n🔍 CHECKING MODEL INPUT SHAPE...")
-model = tf.keras.models.load_model(MODEL_PATH)
-model_input_shape = model.input_shape
-print(f"✅ Model expects input shape: {model_input_shape}")
-print(f"   Should be: (None, {SEQ_LENGTH}, {FEATURES})")
-
-# ==================== LOAD CLASSES ====================
-with open(CLASS_NAMES_PATH, 'rb') as f:
-    CLASS_NAMES = pickle.load(f)
-NUM_CLASSES = len(CLASS_NAMES)
-print(f"✅ Loaded {NUM_CLASSES} classes: {CLASS_NAMES}")
-
-# ==================== MEDIAPIPE SETUP ====================
-print("\n🤖 INITIALIZING MEDIAPIPE...")
-mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-
-holistic = mp_holistic.Holistic(
-    static_image_mode=False,
-    model_complexity=1,
-    smooth_landmarks=True,
-    enable_segmentation=False,
-    smooth_segmentation=True,
-    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-    min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
-    refine_face_landmarks=False  # Nonaktifkan face untuk konsistensi
-)
-
-print("✅ MediaPipe Holistic initialized")
-
-# ==================== FEATURE EXTRACTION - DIMENSION FIX ====================
-def extract_landmarks_fixed(results):
+class BISINDORealtimeRecognition:
     """
-    Extract exactly 162 features to match training data
-    Training data kemungkinan menggunakan:
-    - Hanya tangan kiri dan kanan (tanpa pose): 21 points × 3 × 2 = 126 features
-    - Atau subset dari landmarks
+    Real-time BISINDO Sign Language Recognition
+    Menggunakan webcam untuk detect gesture secara live
     """
-    features = []
     
-    # OPTION 1: Jika training hanya menggunakan tangan (126 features)
-    # Extract left hand landmarks (21 points, x,y,z)
-    if results.left_hand_landmarks:
-        for landmark in results.left_hand_landmarks.landmark:
-            features.extend([landmark.x, landmark.y, landmark.z])
-    else:
-        features.extend([0, 0, 0] * 21)  # 63 features
-    
-    # Extract right hand landmarks (21 points, x,y,z)
-    if results.right_hand_landmarks:
-        for landmark in results.right_hand_landmarks.landmark:
-            features.extend([landmark.x, landmark.y, landmark.z])
-    else:
-        features.extend([0, 0, 0] * 21)  # 63 features
-    
-    # Total sekarang: 126 features
-    
-    # OPTION 2: Tambahkan pose shoulders saja jika perlu mencapai 162
-    # Shoulder landmarks (landmark 11 & 12) = 2 points × 3 = 6 features
-    if results.pose_landmarks:
-        # Left shoulder (11)
-        features.extend([
-            results.pose_landmarks.landmark[11].x,
-            results.pose_landmarks.landmark[11].y,
-            results.pose_landmarks.landmark[11].z
-        ])
-        # Right shoulder (12)
-        features.extend([
-            results.pose_landmarks.landmark[12].x,
-            results.pose_landmarks.landmark[12].y,
-            results.pose_landmarks.landmark[12].z
-        ])
-    else:
-        features.extend([0, 0, 0, 0, 0, 0])  # 6 features
-    
-    # Total: 126 + 6 = 132 features
-    
-    # OPTION 3: Jika masih kurang, tambahkan wrists
-    if results.pose_landmarks:
-        # Left wrist (15) - jika ada
-        if len(results.pose_landmarks.landmark) > 15:
-            features.extend([
-                results.pose_landmarks.landmark[15].x,
-                results.pose_landmarks.landmark[15].y,
-                results.pose_landmarks.landmark[15].z
-            ])
-        else:
-            features.extend([0, 0, 0])
+    def __init__(
+        self,
+        model_path,
+        label_map_path,
+        target_frames=30,
+        confidence_threshold=0.5,
+        smoothing_window=3
+    ):
+        """
+        Args:
+            model_path: Path ke trained model (.h5)
+            label_map_path: Path ke label_map.json
+            target_frames: Jumlah frame untuk prediction
+            confidence_threshold: Minimum confidence untuk show prediction
+            smoothing_window: Window untuk smoothing predictions
+        """
+        print("\n" + "="*70)
+        print("🎬 BISINDO REAL-TIME RECOGNITION SYSTEM")
+        print("="*70)
         
-        # Right wrist (16)
-        if len(results.pose_landmarks.landmark) > 16:
-            features.extend([
-                results.pose_landmarks.landmark[16].x,
-                results.pose_landmarks.landmark[16].y,
-                results.pose_landmarks.landmark[16].z
-            ])
-        else:
-            features.extend([0, 0, 0])
-    else:
-        features.extend([0, 0, 0, 0, 0, 0])
-    
-    # Total: 132 + 6 = 138 features
-    
-    # OPTION 4: Tambahkan face landmarks tertentu jika perlu
-    # Hips (23, 24) = 2 points × 3 = 6 features
-    if results.pose_landmarks and len(results.pose_landmarks.landmark) > 24:
-        # Left hip (23)
-        features.extend([
-            results.pose_landmarks.landmark[23].x,
-            results.pose_landmarks.landmark[23].y,
-            results.pose_landmarks.landmark[23].z
-        ])
-        # Right hip (24)
-        features.extend([
-            results.pose_landmarks.landmark[24].x,
-            results.pose_landmarks.landmark[24].y,
-            results.pose_landmarks.landmark[24].z
-        ])
-    else:
-        features.extend([0, 0, 0, 0, 0, 0])
-    
-    # Total: 138 + 6 = 144 features
-    
-    # OPTION 5: Tambahkan elbows (13, 14) untuk mencapai 162
-    if results.pose_landmarks and len(results.pose_landmarks.landmark) > 14:
-        # Left elbow (13)
-        features.extend([
-            results.pose_landmarks.landmark[13].x,
-            results.pose_landmarks.landmark[13].y,
-            results.pose_landmarks.landmark[13].z
-        ])
-        # Right elbow (14)
-        features.extend([
-            results.pose_landmarks.landmark[14].x,
-            results.pose_landmarks.landmark[14].y,
-            results.pose_landmarks.landmark[14].z
-        ])
-    else:
-        features.extend([0, 0, 0, 0, 0, 0])
-    
-    # Total: 144 + 6 = 150 features
-    
-    # OPTION 6: Tambahkan nose (0) dan ears (7, 8) untuk mencapai 162
-    if results.pose_landmarks:
-        # Nose (0)
-        features.extend([
-            results.pose_landmarks.landmark[0].x,
-            results.pose_landmarks.landmark[0].y,
-            results.pose_landmarks.landmark[0].z
-        ])
+        # Load model
+        print("📦 Loading model...")
+        self.model = tf.keras.models.load_model(model_path)
+        print(f"✅ Model loaded: {model_path}")
         
-        # Left ear (7)
-        if len(results.pose_landmarks.landmark) > 7:
-            features.extend([
-                results.pose_landmarks.landmark[7].x,
-                results.pose_landmarks.landmark[7].y,
-                results.pose_landmarks.landmark[7].z
-            ])
-        else:
-            features.extend([0, 0, 0])
+        # Load label map
+        print("📋 Loading label map...")
+        with open(label_map_path, 'r', encoding='utf-8') as f:
+            self.label_map = json.load(f)
+        self.id_to_label = {v: k for k, v in self.label_map.items()}
+        print(f"✅ {len(self.label_map)} classes loaded")
         
-        # Right ear (8)
-        if len(results.pose_landmarks.landmark) > 8:
-            features.extend([
-                results.pose_landmarks.landmark[8].x,
-                results.pose_landmarks.landmark[8].y,
-                results.pose_landmarks.landmark[8].z
-            ])
-        else:
-            features.extend([0, 0, 0])
-    else:
-        features.extend([0, 0, 0, 0, 0, 0, 0, 0, 0])
+        # Configuration
+        self.target_frames = target_frames
+        self.confidence_threshold = confidence_threshold
+        self.smoothing_window = smoothing_window
+        
+        # Initialize MediaPipe
+        print("🤖 Initializing MediaPipe...")
+        self.mp_holistic = mp.solutions.holistic
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        
+        self.holistic = self.mp_holistic.Holistic(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        print("✅ MediaPipe initialized")
+        
+        # Landmark configuration
+        self.POSE_SUBSET = [11, 12, 13, 14, 15, 16, 23, 24]
+        self.n_pose = len(self.POSE_SUBSET)
+        self.n_hand = 21
+        self.feature_dim = (self.n_pose + 2 * self.n_hand) * 3
+        
+        # Frame buffer untuk collect sequence
+        self.frame_buffer = deque(maxlen=target_frames * 2)
+        self.landmark_buffer = []
+        
+        # Prediction smoothing
+        self.prediction_history = deque(maxlen=smoothing_window)
+        
+        # Recording state
+        self.is_recording = False
+        self.recording_countdown = 0
+        
+        # Statistics
+        self.stats = {
+            'total_predictions': 0,
+            'confident_predictions': 0,
+            'fps': 0
+        }
+        
+        print("="*70)
+        print("🎯 System ready!")
+        print("="*70 + "\n")
     
-    # Total: 150 + 9 = 159 features
-    
-    # OPTION 7: Tambahkan 3 features terakhir (mungkin index tertentu)
-    # Untuk mencapai tepat 162, tambahkan knees (25, 26) atau lainnya
-    if results.pose_landmarks and len(results.pose_landmarks.landmark) > 26:
-        # Left knee (25) - hanya x coordinate
-        features.append(results.pose_landmarks.landmark[25].x)
-        # Right knee (26) - hanya x coordinate  
-        features.append(results.pose_landmarks.landmark[26].x)
-        # Add one more feature
-        features.append(0.0)  # Placeholder
-    else:
-        features.extend([0.0, 0.0, 0.0])
-    
-    # Konversi ke numpy array
-    features_array = np.array(features, dtype=np.float32)
-    
-    # Pastikan panjang tepat 162
-    if len(features_array) > FEATURES:
-        features_array = features_array[:FEATURES]
-    elif len(features_array) < FEATURES:
-        # Padding dengan zeros
-        padding = np.zeros(FEATURES - len(features_array))
-        features_array = np.concatenate([features_array, padding])
-    
-    return features_array
-
-def extract_landmarks_simple(results):
-    """
-    Versi sederhana - cek dulu apa yang digunakan di training
-    Kemungkinan besar hanya tangan kiri dan kanan (126 features)
-    dan beberapa pose landmarks
-    """
-    features = []
-    
-    # Prioritaskan tangan (paling penting untuk BISINDO)
-    # Left hand (21 points × 3)
-    if results.left_hand_landmarks:
-        for landmark in results.left_hand_landmarks.landmark[:21]:  # Pastikan 21 points
-            features.extend([landmark.x, landmark.y, landmark.z])
-    else:
-        features.extend([0, 0, 0] * 21)
-    
-    # Right hand (21 points × 3)
-    if results.right_hand_landmarks:
-        for landmark in results.right_hand_landmarks.landmark[:21]:
-            features.extend([landmark.x, landmark.y, landmark.z])
-    else:
-        features.extend([0, 0, 0] * 21)
-    
-    # Tambahkan pose upper body saja
-    if results.pose_landmarks:
-        # Shoulders, elbows, wrists (12 landmarks = 36 features)
-        upper_body_indices = [11, 12, 13, 14, 15, 16, 23, 24]  # 8 points
-        for idx in upper_body_indices:
-            if idx < len(results.pose_landmarks.landmark):
-                landmark = results.pose_landmarks.landmark[idx]
-                features.extend([landmark.x, landmark.y, landmark.z])
+    def extract_landmarks(self, frame):
+        """Extract landmarks dari frame"""
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            results = self.holistic.process(rgb)
+            
+            if not results.pose_landmarks:
+                return None, None, 0.0
+            
+            # Initialize landmarks array
+            landmarks = np.zeros(self.feature_dim, dtype=np.float32)
+            confidences = []
+            idx = 0
+            
+            # Pose landmarks
+            for lm_idx in self.POSE_SUBSET:
+                lm = results.pose_landmarks.landmark[lm_idx]
+                landmarks[idx:idx+3] = [lm.x, lm.y, lm.z]
+                confidences.append(lm.visibility)
+                idx += 3
+            
+            # Left hand
+            if results.left_hand_landmarks:
+                for lm in results.left_hand_landmarks.landmark:
+                    landmarks[idx:idx+3] = [lm.x, lm.y, lm.z]
+                    idx += 3
+                confidences.extend([1.0] * self.n_hand)
             else:
-                features.extend([0, 0, 0])
-    else:
-        features.extend([0, 0, 0] * 8)  # 8 points × 3
+                landmarks[idx:idx + (self.n_hand * 3)] = np.nan
+                idx += self.n_hand * 3
+                confidences.extend([0.0] * self.n_hand)
+            
+            # Right hand
+            if results.right_hand_landmarks:
+                for lm in results.right_hand_landmarks.landmark:
+                    landmarks[idx:idx+3] = [lm.x, lm.y, lm.z]
+                    idx += 3
+                confidences.extend([1.0] * self.n_hand)
+            else:
+                landmarks[idx:idx + (self.n_hand * 3)] = np.nan
+                confidences.extend([0.0] * self.n_hand)
+            
+            avg_confidence = np.mean(confidences)
+            
+            return results, landmarks, avg_confidence
+            
+        except Exception as e:
+            return None, None, 0.0
     
-    # Pastikan 162 features
-    features_array = np.array(features, dtype=np.float32)
+    def interpolate_missing(self, sequence):
+        """Interpolasi missing values"""
+        seq_clean = sequence.copy()
+        n_frames, n_features = seq_clean.shape
+        
+        for i in range(n_features):
+            col = seq_clean[:, i]
+            nan_mask = np.isnan(col)
+            
+            if np.any(nan_mask) and not np.all(nan_mask):
+                valid_idx = np.where(~nan_mask)[0]
+                valid_vals = col[valid_idx]
+                all_idx = np.arange(n_frames)
+                seq_clean[:, i] = np.interp(all_idx, valid_idx, valid_vals)
+            elif np.all(nan_mask):
+                seq_clean[:, i] = 0.0
+        
+        return seq_clean
     
-    if len(features_array) != FEATURES:
-        print(f"⚠️  Warning: Features extracted: {len(features_array)}, expected: {FEATURES}")
-        if len(features_array) > FEATURES:
-            features_array = features_array[:FEATURES]
-        else:
-            padding = np.zeros(FEATURES - len(features_array))
-            features_array = np.concatenate([features_array, padding])
+    def resample_sequence(self, sequence):
+        """Resample sequence ke target frames"""
+        if len(sequence) == self.target_frames:
+            return np.array(sequence)
+        
+        n_frames_orig = len(sequence)
+        n_features = sequence[0].shape[0]
+        
+        x_old = np.linspace(0, 1, n_frames_orig)
+        x_new = np.linspace(0, 1, self.target_frames)
+        
+        sequence_array = np.array(sequence)
+        resampled = np.zeros((self.target_frames, n_features), dtype=np.float32)
+        
+        for i in range(n_features):
+            resampled[:, i] = np.interp(x_new, x_old, sequence_array[:, i])
+        
+        return resampled
     
-    return features_array
+    def normalize_sequence(self, sequence):
+        """Normalize sequence (sama seperti preprocessing)"""
+        n_frames = sequence.shape[0]
+        n_landmarks = self.feature_dim // 3
+        
+        reshaped = sequence.reshape(n_frames, n_landmarks, 3)
+        normalized = np.zeros_like(reshaped)
+        
+        for t in range(n_frames):
+            frame = reshaped[t].copy()
+            pose = frame[:self.n_pose]
+            
+            # Hip-centered
+            hip_center = (pose[6] + pose[7]) / 2
+            frame -= hip_center
+            
+            # Shoulder scaling
+            shoulder_dist = np.linalg.norm(pose[0] - pose[1])
+            if shoulder_dist > 1e-6:
+                frame /= shoulder_dist
+            
+            # Rotation alignment
+            shoulder_vec = pose[1] - pose[0]
+            angle = np.arctan2(shoulder_vec[1], shoulder_vec[0])
+            cos_a, sin_a = np.cos(-angle), np.sin(-angle)
+            x, y = frame[:, 0].copy(), frame[:, 1].copy()
+            frame[:, 0] = cos_a * x - sin_a * y
+            frame[:, 1] = sin_a * x + cos_a * y
+            
+            normalized[t] = frame
+        
+        return normalized.reshape(n_frames, -1)
+    
+    def preprocess_sequence(self, landmarks_list):
+        """Preprocess sequence untuk prediction"""
+        if len(landmarks_list) < 10:
+            return None
+        
+        # Convert to numpy
+        sequence = np.array(landmarks_list, dtype=np.float32)
+        
+        # Interpolate missing values
+        sequence = self.interpolate_missing(sequence)
+        
+        # Resample to target frames
+        sequence = self.resample_sequence(landmarks_list)
+        
+        # Smoothing
+        for i in range(sequence.shape[1]):
+            sequence[:, i] = gaussian_filter1d(sequence[:, i], sigma=1.0)
+        
+        # Normalize
+        sequence = self.normalize_sequence(sequence)
+        
+        return sequence
+    
+    def predict(self, sequence):
+        """Predict gesture dari sequence"""
+        if sequence is None:
+            return None, 0.0
+        
+        # Add batch dimension
+        sequence_batch = np.expand_dims(sequence, axis=0)
+        
+        # Predict
+        predictions = self.model.predict(sequence_batch, verbose=0)[0]
+        
+        # Get top prediction
+        pred_class = np.argmax(predictions)
+        pred_confidence = predictions[pred_class]
+        pred_label = self.id_to_label[pred_class]
+        
+        self.stats['total_predictions'] += 1
+        if pred_confidence >= self.confidence_threshold:
+            self.stats['confident_predictions'] += 1
+        
+        return pred_label, pred_confidence
+    
+    def smooth_prediction(self, label, confidence):
+        """Smooth predictions menggunakan voting"""
+        self.prediction_history.append((label, confidence))
+        
+        if len(self.prediction_history) < self.smoothing_window:
+            return label, confidence
+        
+        # Voting dari recent predictions
+        recent_labels = [p[0] for p in self.prediction_history]
+        recent_confidences = [p[1] for p in self.prediction_history]
+        
+        # Find most common label
+        unique_labels = list(set(recent_labels))
+        label_counts = [recent_labels.count(l) for l in unique_labels]
+        most_common_idx = np.argmax(label_counts)
+        smoothed_label = unique_labels[most_common_idx]
+        
+        # Average confidence for that label
+        label_confidences = [
+            c for l, c in self.prediction_history 
+            if l == smoothed_label
+        ]
+        smoothed_confidence = np.mean(label_confidences)
+        
+        return smoothed_label, smoothed_confidence
+    
+    def draw_landmarks(self, frame, results):
+        """Draw landmarks pada frame"""
+        if results is None:
+            return frame
+        
+        # Draw pose
+        if results.pose_landmarks:
+            self.mp_drawing.draw_landmarks(
+                frame,
+                results.pose_landmarks,
+                self.mp_holistic.POSE_CONNECTIONS,
+                landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style()
+            )
+        
+        # Draw hands
+        if results.left_hand_landmarks:
+            self.mp_drawing.draw_landmarks(
+                frame,
+                results.left_hand_landmarks,
+                self.mp_holistic.HAND_CONNECTIONS,
+                landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style()
+            )
+        
+        if results.right_hand_landmarks:
+            self.mp_drawing.draw_landmarks(
+                frame,
+                results.right_hand_landmarks,
+                self.mp_holistic.HAND_CONNECTIONS,
+                landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style()
+            )
+        
+        return frame
+    
+    def draw_ui(self, frame, prediction=None, confidence=0.0, fps=0):
+        """Draw UI overlay"""
+        h, w = frame.shape[:2]
+        
+        # Semi-transparent overlay untuk info
+        overlay = frame.copy()
+        
+        # Recording indicator
+        if self.is_recording:
+            if self.recording_countdown > 0:
+                # Countdown
+                cv2.circle(overlay, (w - 50, 50), 30, (0, 165, 255), -1)
+                cv2.putText(
+                    overlay, str(self.recording_countdown),
+                    (w - 65, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3
+                )
+            else:
+                # Recording
+                cv2.circle(overlay, (w - 50, 50), 25, (0, 0, 255), -1)
+                cv2.putText(
+                    overlay, "REC",
+                    (w - 90, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+                )
+        
+        # Info panel
+        info_height = 180
+        cv2.rectangle(overlay, (10, 10), (400, info_height), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        
+        # FPS
+        cv2.putText(
+            frame, f"FPS: {fps:.1f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+        )
+        
+        # Buffer status
+        buffer_pct = len(self.landmark_buffer) / self.target_frames * 100
+        buffer_color = (0, 255, 0) if len(self.landmark_buffer) >= self.target_frames else (0, 165, 255)
+        cv2.putText(
+            frame, f"Buffer: {len(self.landmark_buffer)}/{self.target_frames} ({buffer_pct:.0f}%)",
+            (20, 70),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, buffer_color, 2
+        )
+        
+        # Prediction
+        if prediction and confidence >= self.confidence_threshold:
+            # Prediction panel
+            pred_panel_h = 120
+            cv2.rectangle(frame, (10, h - pred_panel_h - 10), (w - 10, h - 10), (0, 0, 0), -1)
+            
+            # Confidence bar
+            bar_width = int((w - 40) * confidence)
+            bar_color = (0, 255, 0) if confidence > 0.8 else (0, 165, 255) if confidence > 0.6 else (0, 255, 255)
+            cv2.rectangle(frame, (20, h - 40), (20 + bar_width, h - 20), bar_color, -1)
+            cv2.rectangle(frame, (20, h - 40), (w - 20, h - 20), (255, 255, 255), 2)
+            
+            # Prediction text
+            cv2.putText(
+                frame, f"Prediction: {prediction}",
+                (20, h - pred_panel_h + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2
+            )
+            
+            cv2.putText(
+                frame, f"Confidence: {confidence:.2%}",
+                (20, h - pred_panel_h + 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
+            )
+        
+        # Instructions
+        instructions = [
+            "SPACE: Start/Stop Recording",
+            "R: Reset Buffer",
+            "Q: Quit"
+        ]
+        
+        for i, text in enumerate(instructions):
+            cv2.putText(
+                frame, text,
+                (20, 100 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1
+            )
+        
+        return frame
+    
+    def run(self):
+        """Main loop untuk real-time recognition"""
+        print("\n🎥 Starting webcam...")
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            print("❌ Cannot open webcam!")
+            return
+        
+        # Set resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        
+        print("✅ Webcam started")
+        print("\n" + "="*70)
+        print("CONTROLS:")
+        print("  SPACE : Start/Stop recording gesture")
+        print("  R     : Reset buffer")
+        print("  Q     : Quit")
+        print("="*70 + "\n")
+        
+        # Variables
+        fps_list = deque(maxlen=30)
+        current_prediction = None
+        current_confidence = 0.0
+        
+        try:
+            while True:
+                start_time = cv2.getTickCount()
+                
+                ret, frame = cap.read()
+                if not ret:
+                    print("❌ Failed to grab frame")
+                    break
+                
+                # Flip frame horizontally
+                frame = cv2.flip(frame, 1)
+                
+                # Extract landmarks
+                results, landmarks, conf = self.extract_landmarks(frame)
+                
+                # Draw landmarks
+                frame = self.draw_landmarks(frame, results)
+                
+                # Recording logic
+                if self.is_recording:
+                    if self.recording_countdown > 0:
+                        self.recording_countdown -= 1
+                    elif landmarks is not None:
+                        self.landmark_buffer.append(landmarks)
+                        
+                        # Auto predict ketika buffer penuh
+                        if len(self.landmark_buffer) >= self.target_frames:
+                            sequence = self.preprocess_sequence(self.landmark_buffer)
+                            if sequence is not None:
+                                pred_label, pred_conf = self.predict(sequence)
+                                current_prediction, current_confidence = self.smooth_prediction(
+                                    pred_label, pred_conf
+                                )
+                            
+                            # Keep last 50% of buffer for continuous prediction
+                            keep_frames = self.target_frames // 2
+                            self.landmark_buffer = list(self.landmark_buffer)[-keep_frames:]
+                
+                # Calculate FPS
+                end_time = cv2.getTickCount()
+                fps = cv2.getTickFrequency() / (end_time - start_time)
+                fps_list.append(fps)
+                avg_fps = np.mean(fps_list)
+                
+                # Draw UI
+                frame = self.draw_ui(
+                    frame, 
+                    current_prediction, 
+                    current_confidence, 
+                    avg_fps
+                )
+                
+                # Show frame
+                cv2.imshow('BISINDO Real-time Recognition', frame)
+                
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord('q'):
+                    print("\n👋 Quitting...")
+                    break
+                elif key == ord(' '):
+                    # Toggle recording
+                    self.is_recording = not self.is_recording
+                    if self.is_recording:
+                        print("🔴 Recording started (3 seconds countdown)...")
+                        self.recording_countdown = int(avg_fps * 3)  # 3 seconds countdown
+                        self.landmark_buffer = []
+                        current_prediction = None
+                        current_confidence = 0.0
+                    else:
+                        print("⏸️  Recording stopped")
+                elif key == ord('r'):
+                    # Reset buffer
+                    print("🔄 Buffer reset")
+                    self.landmark_buffer = []
+                    current_prediction = None
+                    current_confidence = 0.0
+                    self.is_recording = False
+        
+        except KeyboardInterrupt:
+            print("\n⚠️  Interrupted by user")
+        
+        finally:
+            # Cleanup
+            cap.release()
+            cv2.destroyAllWindows()
+            self.holistic.close()
+            
+            # Print statistics
+            print("\n" + "="*70)
+            print("📊 SESSION STATISTICS")
+            print("="*70)
+            print(f"Total predictions      : {self.stats['total_predictions']}")
+            print(f"Confident predictions  : {self.stats['confident_predictions']}")
+            if self.stats['total_predictions'] > 0:
+                conf_rate = self.stats['confident_predictions'] / self.stats['total_predictions'] * 100
+                print(f"Confidence rate        : {conf_rate:.1f}%")
+            print("="*70)
 
-# ==================== ALTERNATIVE: CHECK TRAINING DATA STRUCTURE ====================
-def check_training_data_structure():
-    """Check bagaimana data training dibangun"""
-    print("\n🔍 CHECKING TRAINING DATA STRUCTURE...")
-    
-    try:
-        data_path = os.path.join(BASE_DIR, "data", "processed", "bisindo_dataset.npz")
-        data = np.load(data_path)
-        X = data['X']
-        
-        print(f"✅ Training data shape: {X.shape}")
-        print(f"   Samples: {X.shape[0]}, Frames: {X.shape[1]}, Features: {X.shape[2]}")
-        
-        # Cek sample pertama
-        sample = X[0]
-        print(f"\n📊 Sample analysis:")
-        print(f"   Shape: {sample.shape}")
-        print(f"   Min value: {sample.min():.4f}")
-        print(f"   Max value: {sample.max():.4f}")
-        print(f"   Mean: {sample.mean():.4f}")
-        print(f"   Std: {sample.std():.4f}")
-        
-        # Cek apakah ada zeros (mungkin hanya tangan saja)
-        zero_percentage = np.sum(sample == 0) / sample.size * 100
-        print(f"   Zero percentage: {zero_percentage:.1f}%")
-        
-        return X.shape[2]  # Return jumlah features
-    except Exception as e:
-        print(f"❌ Error checking training data: {e}")
-        return FEATURES  # Default ke 162
 
-# ==================== NORMALIZATION ====================
-def normalize_landmarks_simple(landmarks):
-    """Simple normalization"""
-    landmarks = np.array(landmarks, dtype=np.float32)
-    
-    # Normalize to [-1, 1] range
-    if np.max(np.abs(landmarks)) > 0:
-        landmarks = landmarks / np.max(np.abs(landmarks))
-    
-    return landmarks
-
-# ==================== BUFFER MANAGEMENT ====================
-class SequenceBuffer:
-    def __init__(self, sequence_length=SEQ_LENGTH, features=FEATURES):
-        self.sequence_length = sequence_length
-        self.features = features
-        self.buffer = deque(maxlen=sequence_length)
-        self.prediction_buffer = deque(maxlen=SMOOTHING_WINDOW)
-        
-    def add_frame(self, landmarks):
-        self.buffer.append(landmarks)
-        
-    def get_sequence(self):
-        if len(self.buffer) < self.sequence_length:
-            # Duplicate last frame
-            last_frame = self.buffer[-1] if self.buffer else np.zeros(self.features)
-            current_buffer = list(self.buffer)
-            while len(current_buffer) < self.sequence_length:
-                current_buffer.append(last_frame)
-            return np.array(current_buffer).reshape(1, self.sequence_length, self.features)
-        return np.array(self.buffer).reshape(1, self.sequence_length, self.features)
-    
-    def is_ready(self):
-        return len(self.buffer) >= self.sequence_length // 2  # Kurangi threshold
-    
-    def clear(self):
-        self.buffer.clear()
-        self.prediction_buffer.clear()
-
-# ==================== MAIN REAL-TIME LOOP - FIXED ====================
 def main():
-    print("\n🎥 STARTING REAL-TIME GESTURE RECOGNITION")
-    print("="*50)
-    print("Press 'q' to quit, 'c' to clear buffer")
+    """Main function"""
+    # Configuration
+    MODEL_PATH = "models/best_model.h5"
+    LABEL_MAP_PATH = "../data/processed/label_map.json"
     
-    # Check training data structure untuk konfirmasi features
-    actual_features = check_training_data_structure()
-    global FEATURES
-    if actual_features != FEATURES:
-        print(f"⚠️  Updating FEATURES from {FEATURES} to {actual_features}")
-        FEATURES = actual_features
-    
-    # Initialize buffer dengan features yang benar
-    buffer = SequenceBuffer(SEQ_LENGTH, FEATURES)
-    
-    # Webcam
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ Cannot open webcam")
+    # Check if files exist
+    if not Path(MODEL_PATH).exists():
+        print(f"❌ Model not found: {MODEL_PATH}")
+        print("Please train the model first!")
         return
     
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    if not Path(LABEL_MAP_PATH).exists():
+        print(f"❌ Label map not found: {LABEL_MAP_PATH}")
+        print("Please run preprocessing first!")
+        return
     
-    print("✅ Webcam initialized")
-    time.sleep(1)
+    # Create recognition system
+    recognizer = BISINDORealtimeRecognition(
+        model_path=MODEL_PATH,
+        label_map_path=LABEL_MAP_PATH,
+        target_frames=30,
+        confidence_threshold=0.5,
+        smoothing_window=3
+    )
     
-    # FPS tracking
-    fps_start_time = time.time()
-    fps_frame_count = 0
-    fps = 0
-    
-    current_gesture = None
-    current_confidence = 0
-    
-    print("\n🚀 Starting... Show your hands to the camera!")
-    
-    try:
-        while True:
-            success, frame = cap.read()
-            if not success:
-                break
-            
-            frame = cv2.flip(frame, 1)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_frame.flags.writeable = False
-            
-            # Process dengan MediaPipe
-            results = holistic.process(rgb_frame)
-            
-            # Extract landmarks - coba kedua method
-            try:
-                landmarks = extract_landmarks_simple(results)
-            except:
-                # Fallback ke method fixed
-                landmarks = extract_landmarks_fixed(results)
-            
-            # Debug: print shape occasionally
-            if fps_frame_count % 30 == 0:
-                print(f"📏 Landmarks shape: {landmarks.shape}, Expected: ({FEATURES},)")
-            
-            # Normalize
-            landmarks = normalize_landmarks_simple(landmarks)
-            
-            # Add to buffer
-            buffer.add_frame(landmarks)
-            
-            # Predict if buffer has some frames
-            if buffer.is_ready():
-                try:
-                    sequence = buffer.get_sequence()
-                    
-                    # Debug sequence shape
-                    if fps_frame_count % 60 == 0:
-                        print(f"🧪 Sequence shape: {sequence.shape}, Expected: (1, {SEQ_LENGTH}, {FEATURES})")
-                    
-                    # Predict
-                    predictions = model.predict(sequence, verbose=0)[0]
-                    predicted_idx = np.argmax(predictions)
-                    confidence = predictions[predicted_idx]
-                    
-                    if confidence > PREDICTION_THRESHOLD:
-                        current_gesture = CLASS_NAMES[predicted_idx]
-                        current_confidence = confidence
-                        buffer.prediction_buffer.append(predicted_idx)
-                        
-                        # Smoothing
-                        if len(buffer.prediction_buffer) >= SMOOTHING_WINDOW:
-                            most_common = Counter(buffer.prediction_buffer).most_common(1)
-                            if most_common:
-                                smoothed_idx = most_common[0][0]
-                                current_gesture = CLASS_NAMES[smoothed_idx]
-                
-                except Exception as e:
-                    print(f"⚠️  Prediction error: {e}")
-                    # Clear buffer on error
-                    buffer.clear()
-            
-            # Draw landmarks
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS,
-                    landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
-                )
-            
-            if results.left_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2, circle_radius=4),
-                    mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2)
-                )
-            
-            if results.right_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=4),
-                    mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2)
-                )
-            
-            # FPS calculation
-            fps_frame_count += 1
-            if time.time() - fps_start_time >= 1.0:
-                fps = fps_frame_count
-                fps_frame_count = 0
-                fps_start_time = time.time()
-            
-            # Display info
-            cv2.putText(frame, f"FPS: {fps}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            buffer_status = "READY" if buffer.is_ready() else f"BUFFER: {len(buffer.buffer)}/{SEQ_LENGTH}"
-            cv2.putText(frame, buffer_status, (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            if current_gesture:
-                cv2.putText(frame, f"{current_gesture}: {current_confidence:.1%}", 
-                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            
-            # Show frame
-            cv2.imshow('BISINDO Real-time', frame)
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('c'):
-                buffer.clear()
-                current_gesture = None
-                print("🔄 Buffer cleared")
-            elif key == ord('d'):
-                # Debug info
-                print(f"\n🔍 DEBUG INFO:")
-                print(f"  Buffer frames: {len(buffer.buffer)}")
-                if buffer.buffer:
-                    print(f"  Last frame shape: {buffer.buffer[-1].shape}")
-                    print(f"  Last frame min/max: {buffer.buffer[-1].min():.3f}/{buffer.buffer[-1].max():.3f}")
-    
-    except KeyboardInterrupt:
-        print("\n🛑 Stopped by user")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        holistic.close()
-        print("\n✅ Real-time recognition stopped")
+    # Run real-time recognition
+    recognizer.run()
 
-# ==================== QUICK TEST FUNCTION ====================
-def quick_dimension_test():
-    """Quick test to determine correct feature dimensions"""
-    print("\n🧪 QUICK DIMENSION TEST")
-    print("="*50)
-    
-    # Load training data
-    try:
-        data_path = os.path.join(BASE_DIR, "data", "processed", "bisindo_dataset.npz")
-        data = np.load(data_path)
-        X = data['X']
-        
-        print(f"Training data shape: {X.shape}")
-        print(f"Features per frame: {X.shape[2]}")
-        
-        # Analyze first sample
-        sample = X[0]
-        print(f"\nFirst sample shape: {sample.shape}")
-        
-        # Try to understand structure
-        print("\nTrying to understand feature structure...")
-        
-        # Mungkin structure: [hand_left, hand_right, pose_upper_body]
-        # 21 points × 3 × 2 = 126 (hands)
-        # 12 points × 3 = 36 (pose) -> total 162
-        
-        # Test MediaPipe extraction
-        cap = cv2.VideoCapture(0)
-        success, frame = cap.read()
-        if success:
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic.process(rgb)
-            
-            # Test extraction
-            features_simple = extract_landmarks_simple(results)
-            print(f"\nSimple extraction: {len(features_simple)} features")
-            
-            features_fixed = extract_landmarks_fixed(results)
-            print(f"Fixed extraction: {len(features_fixed)} features")
-            
-            # Try prediction
-            if len(features_simple) == FEATURES:
-                # Create dummy sequence
-                dummy_sequence = np.array([features_simple] * SEQ_LENGTH)
-                dummy_sequence = dummy_sequence.reshape(1, SEQ_LENGTH, FEATURES)
-                
-                try:
-                    pred = model.predict(dummy_sequence, verbose=0)
-                    print(f"\n✅ Prediction successful! Shape: {pred.shape}")
-                    print(f"   Sample prediction: {np.argmax(pred[0])} - {CLASS_NAMES[np.argmax(pred[0])]}")
-                except Exception as e:
-                    print(f"❌ Prediction failed: {e}")
-        
-        cap.release()
-        
-    except Exception as e:
-        print(f"❌ Test failed: {e}")
 
-# ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', default='realtime', 
-                       choices=['realtime', 'test', 'debug'])
-    
-    args = parser.parse_args()
-    
-    if args.mode == 'debug' or args.mode == 'test':
-        quick_dimension_test()
-    else:
-        main()
+    main()
