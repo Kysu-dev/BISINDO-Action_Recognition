@@ -1,7 +1,7 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Fix OpenMP error
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"     # Hide TF warnings
+# HAPUS: os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"  # ⚠️ JANGAN DISABLE GPU!
 
 import cv2
 import numpy as np
@@ -9,327 +9,351 @@ import mediapipe as mp
 from pathlib import Path
 import json
 from scipy.ndimage import gaussian_filter1d
-from sklearn.model_selection import train_test_split
+from scipy.interpolate import interp1d
+import warnings
+warnings.filterwarnings('ignore')
 
-
-class ImprovedBISINDOPreprocessor:
-
+class BISINDODataPreprocessor:
+    """
+    PREPROCESSOR MURNI: Convert videos → NPZ format
+    NO TRAIN/VAL/TEST SPLIT - itu tugas training script
+    """
+    
     def __init__(
         self,
         dataset_path,
         output_path,
         target_frames=30,
-        use_rotation_alignment=True,
-        confidence_threshold=0.5,
-        smoothing_sigma=1.0,
-        add_velocity=True,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        random_seed=42
+        min_frames=10,
+        smoothing=True
     ):
+        """
+        Args:
+            dataset_path: Path ke folder video mentah
+            output_path: Path untuk save dataset.npz
+            target_frames: Frame tetap untuk semua video
+            min_frames: Minimum frames untuk video valid
+            smoothing: Enable temporal smoothing
+        """
         self.dataset_path = Path(dataset_path)
         self.output_path = Path(output_path)
-
+        
         if not self.dataset_path.exists():
-            raise FileNotFoundError(f"❌ Dataset path not found: {self.dataset_path}")
-
+            raise FileNotFoundError(f"Dataset path tidak ditemukan: {self.dataset_path}")
+        
         self.target_frames = target_frames
-        self.use_rotation_alignment = use_rotation_alignment
-        self.confidence_threshold = confidence_threshold
-        self.smoothing_sigma = smoothing_sigma
-        self.add_velocity = add_velocity
-        self.train_ratio = train_ratio
-        self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
-        self.random_seed = random_seed
-
+        self.min_frames = min_frames
+        self.smoothing = smoothing
+        
+        # Initialize MediaPipe dengan GPU SUPPORT
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
             static_image_mode=False,
-            model_complexity=1,
+            model_complexity=1,  # Bisa 2 untuk akurasi lebih tinggi
             smooth_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
-
-        self.POSE_SUBSET = [11, 12, 13, 14, 15, 16, 23, 24]
-        self.n_pose = len(self.POSE_SUBSET)
-        self.n_hand = 21
-        self.feature_dim = (self.n_pose + 2 * self.n_hand) * 3
-
+        
+        # Landmarks untuk bahasa isyarat (upper body focus)
+        self.POSE_LANDMARKS = [11, 12, 13, 14, 15, 16, 23, 24]  # Shoulders, elbows, wrists, hips
+        self.HAND_LANDMARKS = 21  # MediaPipe hand landmarks
+        
+        self.n_pose = len(self.POSE_LANDMARKS)
+        self.n_hand = self.HAND_LANDMARKS
+        self.feature_dim = (self.n_pose + 2 * self.n_hand) * 3  # (x, y, z)
+        
         self.output_path.mkdir(parents=True, exist_ok=True)
-
-        self.stats = {
-            "total_videos": 0,
-            "processed_videos": 0,
-            "failed_videos": 0,
-            "low_confidence_frames": 0,
-            "interpolated_frames": 0,
-        }
-
-        print("\n" + "=" * 70)
-        print("IMPROVED BISINDO Preprocessor Initialized")
-        print("=" * 70)
-        print(f"Dataset   : {self.dataset_path}")
-        print(f"Output    : {self.output_path}")
-        print(f"Frames    : {self.target_frames}")
-        print(f"Features  : {self.feature_dim}")
-        print(f"Velocity  : {self.add_velocity}")
-        print(f"Split     : {self.train_ratio}/{self.val_ratio}/{self.test_ratio}")
-        print("=" * 70 + "\n")
-
-    def extract_landmarks(self, frame):
-        """Extract landmarks dengan handling yang lebih baik"""
+        
+        print("\n" + "="*60)
+        print("BISINDO PREPROCESSOR - VIDEO TO NPZ CONVERTER")
+        print("="*60)
+        print(f"Input:  {self.dataset_path}")
+        print(f"Output: {self.output_path}")
+        print(f"Target: {self.target_frames} frames")
+        print(f"Features: {self.feature_dim} dimensions")
+        print("="*60 + "\n")
+    
+    def extract_frame_landmarks(self, frame):
+        """
+        Extract landmarks dari single frame
+        Returns: landmarks array atau None jika gagal
+        """
         try:
+            # Convert BGR to RGB
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            
+            # Process dengan MediaPipe
             results = self.holistic.process(rgb)
-
-            if not results.pose_landmarks:
-                return None, 0.0
-
-            coords = []
-            conf = []
-
-            # Pose landmarks
-            for i in self.POSE_SUBSET:
-                lm = results.pose_landmarks.landmark[i]
-                coords.extend([lm.x, lm.y, lm.z])
-                conf.append(lm.visibility)
-
-            # Left hand
+            
+            # Initialize array untuk landmarks
+            landmarks = np.zeros(self.feature_dim, dtype=np.float32)
+            idx = 0
+            
+            # 1. Pose landmarks
+            if results.pose_landmarks:
+                for lm_idx in self.POSE_LANDMARKS:
+                    lm = results.pose_landmarks.landmark[lm_idx]
+                    landmarks[idx:idx+3] = [lm.x, lm.y, lm.z]
+                    idx += 3
+            else:
+                # Jika pose tidak terdeteksi, skip frame ini
+                return None
+            
+            # 2. Left hand landmarks
             if results.left_hand_landmarks:
                 for lm in results.left_hand_landmarks.landmark:
-                    coords.extend([lm.x, lm.y, lm.z])
-                conf.extend([1.0] * self.n_hand)
+                    landmarks[idx:idx+3] = [lm.x, lm.y, lm.z]
+                    idx += 3
             else:
-                coords.extend([None] * self.n_hand * 3)  # ✅ Use None instead of 0
-                conf.extend([0.0] * self.n_hand)
-
-            # Right hand
+                # Isi dengan NaN untuk interpolasi nanti
+                landmarks[idx:idx+(self.n_hand*3)] = np.nan
+                idx += self.n_hand * 3
+            
+            # 3. Right hand landmarks
             if results.right_hand_landmarks:
                 for lm in results.right_hand_landmarks.landmark:
-                    coords.extend([lm.x, lm.y, lm.z])
-                conf.extend([1.0] * self.n_hand)
+                    landmarks[idx:idx+3] = [lm.x, lm.y, lm.z]
+                    idx += 3
             else:
-                coords.extend([None] * self.n_hand * 3)  # ✅ Use None instead of 0
-                conf.extend([0.0] * self.n_hand)
-
-            return np.array(coords, dtype=object), float(np.mean(conf))
-
+                landmarks[idx:idx+(self.n_hand*3)] = np.nan
+                idx += self.n_hand * 3
+            
+            return landmarks
+            
         except Exception as e:
-            return None, 0.0
-
-    def interpolate_missing(self, frames):
-        """✅ Interpolasi untuk missing hand landmarks"""
-        frames = np.array(frames, dtype=float)  # Convert to float
-        n_frames, n_features = frames.shape
+            print(f"⚠️ Error ekstraksi: {e}")
+            return None
+    
+    def interpolate_missing_landmarks(self, sequence):
+        """
+        Interpolasi landmarks yang missing (NaN)
+        """
+        if sequence.size == 0:
+            return sequence
+        
+        seq_interp = sequence.copy()
+        n_frames, n_features = seq_interp.shape
         
         for i in range(n_features):
-            col = frames[:, i]
-            mask = ~np.isnan(col)
+            col = seq_interp[:, i]
+            nan_mask = np.isnan(col)
             
-            if mask.sum() == 0:  # Semua missing
-                frames[:, i] = 0.0
-            elif mask.sum() < n_frames:  # Ada yang missing
-                indices = np.arange(n_frames)
-                frames[:, i] = np.interp(indices, indices[mask], col[mask])
-                self.stats["interpolated_frames"] += 1
+            # Jika ada NaN
+            if np.any(nan_mask) and not np.all(nan_mask):
+                # Indeks yang valid
+                valid_idx = np.where(~nan_mask)[0]
+                valid_vals = col[valid_idx]
+                
+                # Interpolasi semua frame
+                all_idx = np.arange(n_frames)
+                col_interp = np.interp(all_idx, valid_idx, valid_vals)
+                seq_interp[:, i] = col_interp
+            elif np.all(nan_mask):
+                # Jika semua NaN, set ke 0
+                seq_interp[:, i] = 0.0
         
-        return frames
-
-    def uniform_sampling(self, seq):
-        """Uniform sampling dengan validasi"""
-        n, f = seq.shape
-        if n == self.target_frames:
-            return seq
-        x_old = np.arange(n)
-        x_new = np.linspace(0, n - 1, self.target_frames)
-        out = np.zeros((self.target_frames, f))
-        for i in range(f):
-            out[:, i] = np.interp(x_new, x_old, seq[:, i])
-        return out
-
-    def compute_velocity(self, seq):
-        """✅ Hitung velocity features"""
-        velocity = np.diff(seq, axis=0)
-        velocity = np.vstack([velocity[0], velocity])  # Pad first frame
-        return velocity
-
-    def normalize(self, seq):
-        """Normalisasi dengan validasi yang lebih baik"""
-        n_frames = seq.shape[0]
+        return seq_interp
+    
+    def normalize_sequence(self, sequence):
+        """
+        Normalize sequence: center dan scale
+        """
+        n_frames = sequence.shape[0]
         n_landmarks = self.feature_dim // 3
-        reshaped = seq.reshape(n_frames, n_landmarks, 3)
-        out = np.zeros_like(reshaped)
-
+        
+        # Reshape ke (frames, landmarks, 3)
+        reshaped = sequence.reshape(n_frames, n_landmarks, 3)
+        normalized = np.zeros_like(reshaped)
+        
         for t in range(n_frames):
             frame = reshaped[t].copy()
-            pose = frame[:self.n_pose]
-
-            # Hip center (indices 6,7 dalam POSE_SUBSET adalah hips)
-            hip = (pose[6] + pose[7]) / 2
-            frame -= hip
-
-            # Shoulder normalization
-            shoulder_width = np.linalg.norm(pose[0] - pose[1])
-            if shoulder_width < 1e-6:
-                shoulder_width = 1.0
-            frame /= shoulder_width
-
-            # Rotation alignment
-            if self.use_rotation_alignment:
-                v = pose[1] - pose[0]
-                angle = np.arctan2(v[1], v[0])
-                c, s = np.cos(-angle), np.sin(-angle)
-                x, y = frame[:, 0].copy(), frame[:, 1].copy()
-                frame[:, 0] = c * x - s * y
-                frame[:, 1] = s * x + c * y
-
-            out[t] = frame
-
-        return out.reshape(n_frames, -1)
-
+            
+            # 1. Center berdasarkan hip (indeks 6 & 7 di pose landmarks)
+            if self.n_pose >= 8:
+                hip_center = (frame[6] + frame[7]) / 2
+                frame -= hip_center
+            
+            # 2. Scale berdasarkan shoulder width
+            if self.n_pose >= 2:
+                shoulder_width = np.linalg.norm(frame[0] - frame[1])
+                if shoulder_width > 0.01:  # Hindari division by zero
+                    frame /= shoulder_width
+            
+            # 3. Rotation alignment (opsional)
+            if self.n_pose >= 2:
+                shoulder_vec = frame[1] - frame[0]
+                shoulder_vec[2] = 0  # Ignore z-axis
+                
+                if np.linalg.norm(shoulder_vec) > 0.01:
+                    angle = np.arctan2(shoulder_vec[1], shoulder_vec[0])
+                    c, s = np.cos(-angle), np.sin(-angle)
+                    
+                    # Rotasi hanya x dan y
+                    x_rot = c * frame[:, 0] - s * frame[:, 1]
+                    y_rot = s * frame[:, 0] + c * frame[:, 1]
+                    frame[:, 0] = x_rot
+                    frame[:, 1] = y_rot
+            
+            normalized[t] = frame
+        
+        return normalized.reshape(n_frames, -1)
+    
     def process_video(self, video_path):
-        """Process video dengan handling yang lebih robust"""
-        cap = None
-        try:
-            cap = cv2.VideoCapture(str(video_path))
-            frames = []
-
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                lm, conf = self.extract_landmarks(frame)
-                if lm is not None:
-                    if conf >= self.confidence_threshold:
-                        frames.append(lm)
-                    else:
-                        self.stats["low_confidence_frames"] += 1
-
-            # ✅ Validasi minimum frames (50% dari target)
-            min_frames = max(10, self.target_frames // 2)
-            if len(frames) < min_frames:
-                return None
-
-            # ✅ Interpolasi missing values
-            seq = self.interpolate_missing(frames)
+        """
+        Process single video menjadi sequence
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            print(f"❌ Tidak bisa buka: {video_path.name}")
+            return None
+        
+        frames_data = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-            # Uniform sampling
-            seq = self.uniform_sampling(seq)
+            landmarks = self.extract_frame_landmarks(frame)
+            if landmarks is not None:
+                frames_data.append(landmarks)
+        
+        cap.release()
+        
+        # Validasi jumlah frame
+        if len(frames_data) < self.min_frames:
+            print(f"⚠️ Video {video_path.name}: Hanya {len(frames_data)} frames (min: {self.min_frames})")
+            return None
+        
+        # Convert ke numpy array
+        sequence = np.array(frames_data, dtype=np.float32)
+        
+        # Interpolasi missing landmarks
+        sequence = self.interpolate_missing_landmarks(sequence)
+        
+        # Resample ke fixed length
+        if len(sequence) != self.target_frames:
+            x_old = np.linspace(0, 1, len(sequence))
+            x_new = np.linspace(0, 1, self.target_frames)
             
-            # Smoothing
-            if self.smoothing_sigma > 0:
-                for i in range(seq.shape[1]):
-                    seq[:, i] = gaussian_filter1d(seq[:, i], self.smoothing_sigma)
-            
-            # Normalization
-            seq = self.normalize(seq)
-
-            # ✅ Add velocity features
-            if self.add_velocity:
-                vel = self.compute_velocity(seq)
-                seq = np.concatenate([seq, vel], axis=1)
-
-            return seq
-
-        finally:
-            if cap is not None:
-                cap.release()
-
+            resampled = np.zeros((self.target_frames, self.feature_dim), dtype=np.float32)
+            for i in range(self.feature_dim):
+                resampled[:, i] = np.interp(x_new, x_old, sequence[:, i])
+            sequence = resampled
+        
+        # Smoothing temporal
+        if self.smoothing:
+            for i in range(sequence.shape[1]):
+                sequence[:, i] = gaussian_filter1d(sequence[:, i], sigma=1.0)
+        
+        # Normalize
+        sequence = self.normalize_sequence(sequence)
+        
+        return sequence
+    
     def process_dataset(self):
-        """Process dataset dengan train/val/test split"""
+        """
+        Process semua video di dataset
+        Returns: X, y, label_map saved as .npz
+        """
+        # Cari semua class folder
         class_folders = sorted([f for f in self.dataset_path.iterdir() if f.is_dir()])
-        label_map = {c.name: i for i, c in enumerate(class_folders)}
-
+        
+        if not class_folders:
+            raise ValueError(f"Tidak ada folder kelas di: {self.dataset_path}")
+        
+        # Buat label mapping
+        label_map = {folder.name: idx for idx, folder in enumerate(class_folders)}
+        
+        X_all, y_all = [], []
+        
+        print("🎬 Memulai preprocessing video...")
+        
+        for class_name, class_idx in label_map.items():
+            class_path = self.dataset_path / class_name
+            
+            # Cari semua video files
+            video_files = []
+            for ext in ['*.mp4', '*.avi', '*.mov', '*.mkv']:
+                video_files.extend(class_path.glob(ext))
+            
+            if not video_files:
+                print(f"⚠️ Tidak ada video di folder: {class_name}")
+                continue
+            
+            print(f"\n📂 Kelas: {class_name} ({len(video_files)} video)")
+            
+            for i, video_path in enumerate(video_files, 1):
+                print(f"   [{i}/{len(video_files)}] Processing {video_path.name}...", end="\r")
+                
+                sequence = self.process_video(video_path)
+                if sequence is not None:
+                    X_all.append(sequence)
+                    y_all.append(class_idx)
+            
+            print(f"   ✅ {class_name}: {len([x for x in y_all if x == class_idx])} video berhasil")
+        
+        if not X_all:
+            raise ValueError("❌ Tidak ada video yang berhasil diproses!")
+        
+        # Convert ke numpy arrays
+        X_all = np.array(X_all, dtype=np.float32)
+        y_all = np.array(y_all, dtype=np.int32)
+        
+        # Simpan sebagai single .npz file
+        output_file = self.output_path / "bisindo_dataset.npz"
+        np.savez_compressed(
+            output_file,
+            X=X_all,
+            y=y_all,
+            label_map=label_map,
+            feature_dim=self.feature_dim,
+            target_frames=self.target_frames
+        )
+        
+        # Simpan label map sebagai json juga
         with open(self.output_path / "label_map.json", "w") as f:
             json.dump(label_map, f, indent=2)
-
-        X, y, filenames = [], [], []
-
-        for cname, label in label_map.items():
-            videos = list((self.dataset_path / cname).glob("*.mp4"))
-            print(f"\n📁 {cname} ({len(videos)} videos)")
-
-            for i, v in enumerate(videos, 1):
-                print(f"   [{i}/{len(videos)}] {v.name}", end="\r")
-                self.stats["total_videos"] += 1
-                seq = self.process_video(v)
-                if seq is not None:
-                    X.append(seq)
-                    y.append(label)
-                    filenames.append(v.name)
-                    self.stats["processed_videos"] += 1
-                else:
-                    self.stats["failed_videos"] += 1
-            print()  # New line after class
-
-        X = np.array(X)
-        y = np.array(y)
-
-        # ✅ Train/Val/Test Split
-        X_temp, X_test, y_temp, y_test, fn_temp, fn_test = train_test_split(
-            X, y, filenames, 
-            test_size=self.test_ratio, 
-            stratify=y,
-            random_state=self.random_seed
-        )
-
-        val_size = self.val_ratio / (self.train_ratio + self.val_ratio)
-        X_train, X_val, y_train, y_val, fn_train, fn_val = train_test_split(
-            X_temp, y_temp, fn_temp,
-            test_size=val_size,
-            stratify=y_temp,
-            random_state=self.random_seed
-        )
-
-        # Save splits
-        np.savez_compressed(
-            self.output_path / "bisindo_train.npz",
-            X=X_train, y=y_train, filenames=fn_train
-        )
-        np.savez_compressed(
-            self.output_path / "bisindo_val.npz",
-            X=X_val, y=y_val, filenames=fn_val
-        )
-        np.savez_compressed(
-            self.output_path / "bisindo_test.npz",
-            X=X_test, y=y_test, filenames=fn_test
-        )
-
-        # Save statistics
-        stats_summary = {
-            **self.stats,
-            "train_samples": len(X_train),
-            "val_samples": len(X_val),
-            "test_samples": len(X_test),
-            "feature_dim": X_train.shape[2]
-        }
         
-        with open(self.output_path / "preprocessing_stats.json", "w") as f:
-            json.dump(stats_summary, f, indent=2)
+        print("\n" + "="*60)
+        print("✅ PREPROCESSING SELESAI!")
+        print("="*60)
+        print(f"Total samples: {X_all.shape[0]}")
+        print(f"Sequence shape: {X_all.shape[1:]} (frames × features)")
+        print(f"Number of classes: {len(label_map)}")
+        print(f"Output file: {output_file}")
+        print("="*60)
+        
+        return X_all, y_all, label_map
 
-        print("\n" + "=" * 70)
-        print("✅ PREPROCESSING COMPLETE")
-        print("=" * 70)
-        print(f"Train: {X_train.shape}")
-        print(f"Val  : {X_val.shape}")
-        print(f"Test : {X_test.shape}")
-        print(f"\nProcessed: {self.stats['processed_videos']}/{self.stats['total_videos']}")
-        print(f"Failed: {self.stats['failed_videos']}")
-        print(f"Interpolated frames: {self.stats['interpolated_frames']}")
-        print("=" * 70)
+
+def main():
+    """Main function untuk preprocessing standalone"""
+    # Konfigurasi
+    DATASET_PATH = r"D:\SEMESTER 5\Computer Visual\baruu\BISINDO-Action_Recognition\data\raw_video"
+    OUTPUT_PATH = r"D:\SEMESTER 5\Computer Visual\baruu\BISINDO-Action_Recognition\data\processed"
+    
+    # Buat preprocessor
+    preprocessor = BISINDODataPreprocessor(
+        dataset_path=DATASET_PATH,
+        output_path=OUTPUT_PATH,
+        target_frames=30,
+        min_frames=10,
+        smoothing=True
+    )
+    
+    # Jalankan preprocessing
+    try:
+        X, y, label_map = preprocessor.process_dataset()
+        print(f"\n🎉 Dataset siap untuk training!")
+        print(f"   Gunakan file: {OUTPUT_PATH}/bisindo_dataset.npz")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    preprocessor = ImprovedBISINDOPreprocessor(
-        dataset_path=r"D:\SEMESTER 5\Computer Visual\baruu\BISINDO-Action_Recognition\data\raw_video",
-        output_path=r"D:\SEMESTER 5\Computer Visual\baruu\BISINDO-Action_Recognition\data\processed",
-        target_frames=30,
-        add_velocity=True,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15
-    )
-    preprocessor.process_dataset()
+    main()
