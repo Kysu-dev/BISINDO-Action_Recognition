@@ -436,6 +436,8 @@ class BISINDORealtimeRecognition:
         fps_list = deque(maxlen=30)
         current_prediction = None
         current_confidence = 0.0
+        frame_skip = 2  # ✅ Process every N frames (1=all, 2=half, 3=third)
+        frame_count = 0
         
         try:
             while True:
@@ -449,11 +451,19 @@ class BISINDORealtimeRecognition:
                 # Flip frame horizontally
                 frame = cv2.flip(frame, 1)
                 
-                # Extract landmarks
-                results, landmarks, conf = self.extract_landmarks(frame)
+                frame_count += 1
                 
-                # Draw landmarks
-                frame = self.draw_landmarks(frame, results)
+                # ✅ Process landmarks only every N frames for better FPS
+                if frame_count % frame_skip == 0:
+                    # Extract landmarks
+                    results, landmarks, conf = self.extract_landmarks(frame)
+                else:
+                    # Skip processing, use last results for drawing
+                    results, landmarks, conf = None, None, 0.0
+                
+                # Draw landmarks (always draw, even if not processing)
+                if results is not None:
+                    frame = self.draw_landmarks(frame, results)
                 
                 # Recording logic
                 if self.is_recording:
@@ -568,7 +578,7 @@ def main():
     recognizer = BISINDORealtimeRecognition(
         model_path=MODEL_PATH,
         label_map_path=LABEL_MAP_PATH,
-        target_frames=20,  # ✅ 30→20 (lebih cepat penuh!)
+        target_frames=30,  # ✅ HARUS 30 (sesuai training!)
         confidence_threshold=0.3,
         smoothing_window=3
     )
