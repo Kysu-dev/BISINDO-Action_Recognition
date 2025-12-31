@@ -1,0 +1,35 @@
+{
+  "model_info": {
+    "architecture": "Conv1D + BiLSTM",
+    "num_classes": 10,
+    "feature_dim": 150,
+    "max_frames": 40,
+    "total_params": 28026
+  },
+  "dataset_split": {
+    "total_samples": 513,
+    "train_samples": 1044,
+    "val_samples": 62,
+    "test_samples": 103
+  },
+  "performance": {
+    "train_accuracy": 0.998084306716919,
+    "val_accuracy": 1.0,
+    "test_accuracy": 1.0
+  },
+  "label_map": {
+    "Apa": 0,
+    "Apa Kabar": 1,
+    "Baik": 2,
+    "Belajar": 3,
+    "Dia": 4,
+    "Halo": 5,
+    "Kita": 6,
+    "Neutral": 7,
+    "Saya": 8,
+    "Terima Kasih": 9
+  },
+  "training_date": "20251231_031520"
+}
+
+
